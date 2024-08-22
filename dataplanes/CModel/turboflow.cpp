@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <set>
+#include <tuple>
 
 #include <math.h>
 #include <stdlib.h>
@@ -12,6 +14,9 @@
 #include <fstream>
 #include <cstring>
 #include <sstream> // for ostringstream
+#include <vector>
+#include <sstream>
+#include <iomanip>
 using namespace std;
 
 // Generate 
@@ -24,14 +29,18 @@ using namespace std;
 // g++ turboflow.cpp -o turboflow -lpcap -std=c++11
 // ./turboflow ~/datasets/caida2015/caida2015_02_dirA.pcap 13
 
+// Define a type alias for the 5-tuple that uniquely identifies a flow
+using FlowTuple = tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint8_t>;
 
 uint64_t dbg_packetCt;
 uint64_t dbg_evictCt;
+uint64_t total_flowCt;
+using Flow = tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint8_t>;
+set<FlowTuple> uniqueFlows;
 
 uint64_t dbg_collisionCt;
 uint64_t dbg_removeFlowCt;
 uint64_t dbg_addFlowCt;
-
 
 // Static options.
 #define traceType 1 // 0 = ethernet pcap, 1 = ip4v pcap (i.e., caida datasets)
@@ -87,9 +96,73 @@ unsigned simpleHash(const char* s, int len, int maxHashVal);
 std::string getKey(const struct ip* ipHeader, const struct tcphdr* tcpHeader);
 uint64_t getMicrosecondTs(uint32_t seconds, uint32_t microSeconds);
 void printStats();
-
+FlowTuple extractFlowTuple(const u_char* packet);
+FlowTuple extractFlow(const struct ip* ipHeader, const struct tcphdr* tcpHeader);
+void countUniqueFlows(const struct ip* ipHeader, const struct tcphdr* tcpHeader);
+std::string toHexString(const std::string& str);
+void printFlowTuple(const FlowTuple& flow);
 
 int main(int argc, char *argv[]) {
+    if (argc < 3){
+        cout << "incorrect number of arguments. Need at least 2. (filenames, hash size)." << endl;
+        return 0;
+    }
+    
+    int numFiles = argc - 2;
+    vector<char*> inputFiles;
+    for (int i = 1; i <= numFiles; i++) {
+        inputFiles.push_back(argv[i]);
+        cout << "reading from file: " << argv[i] << endl;
+    }
+
+    int tableSize = atoi(argv[argc - 1]);
+    stateInit(tableSize);
+
+    vector<pcap_t*> descrs;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    // Open all PCAP files
+    for (int i = 0; i < numFiles; i++) {
+        pcap_t *descr = pcap_open_offline(inputFiles[i], errbuf);
+        if (descr == NULL) {
+            cerr << "pcap_open_offline() failed for " << inputFiles[i] << ": " << errbuf << endl;
+            return 1;
+        }
+        descrs.push_back(descr);
+    }
+
+    printHeader();
+
+    int active_pcap_count = descrs.size();
+    while (active_pcap_count > 0) {
+        for (size_t i = 0; i < descrs.size(); i++) {
+            if (descrs[i] == nullptr) continue;
+
+            struct pcap_pkthdr* header;
+            const u_char* data;
+            int res = pcap_next_ex(descrs[i], &header, &data);
+
+            if (res == 1) { // Packet successfully read
+                packetHandler(nullptr, header, data);
+                
+            } else if (res == -1) { // Error occurred
+                cerr << "pcap_next_ex() failed: " << pcap_geterr(descrs[i]) << endl;
+                return 1;
+            } else if (res == -2) { // EOF reached
+                pcap_close(descrs[i]);
+                descrs[i] = nullptr;
+                active_pcap_count--;
+            }
+        }
+    }
+
+    cout << "FINAL STATS:" << endl;
+    printStats();
+
+    return 0;
+}
+
+int main_onepcap(int argc, char *argv[]) {
   if (argc != 3){
     cout << "incorrect number of arguments. Need 2. (filename, hash size)." << endl;
     return 0;
@@ -120,6 +193,13 @@ int main(int argc, char *argv[]) {
   return 0;
 }
 
+void countUniqueFlows(const struct ip* ipHeader, const struct tcphdr* tcpHeader) {
+    //FlowTuple flow = extractFlowTuple(packet);
+    FlowTuple flow = extractFlow(ipHeader, tcpHeader);
+    uniqueFlows.insert(flow);  // Automatically handles uniqueness
+    //printFlowTuple(flow);
+}
+
 void stateInit(int tableSize){
   TABLELEN = tableSize;
   cout << "initializing hash tables to size: " << TABLELEN << endl;
@@ -137,7 +217,25 @@ void stateInit(int tableSize){
   return;  
 }
 
+void print_flowinfo(const struct ip* ipHeader, const struct tcphdr* tcpHeader) {
+    // Extract the 5-tuple
+    uint32_t srcIP = ipHeader->ip_src.s_addr;
+    uint32_t dstIP = ipHeader->ip_dst.s_addr;
+    uint16_t srcPort = ntohs(tcpHeader->source);
+    uint16_t dstPort = ntohs(tcpHeader->dest);
+    uint8_t protocol = ipHeader->ip_p;
 
+    // Convert IP addresses to readable format
+    struct in_addr srcAddr, dstAddr;
+    srcAddr.s_addr = srcIP;
+    dstAddr.s_addr = dstIP;
+
+    // Print the 5-tuple
+    std::cout << "Flow111: "
+              << inet_ntoa(srcAddr) << ":" << srcPort << " -> "
+              << inet_ntoa(dstAddr) << ":" << dstPort
+              << " Protocol: " << static_cast<int>(protocol) << std::endl;
+}
 // The packet handler that implements the flow record generator. 
 void packetHandler(u_char *userData, const struct pcap_pkthdr* pkthdr, const u_char* packet) {
   const struct ether_header* ethernetHeader;
@@ -152,10 +250,12 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr* pkthdr, const u_c
   }
   else if (traceType == 1) {
     ipHeader = (struct ip*)(packet);
-
+ 
   }
   tcpHeader = (tcphdr*)((u_char*)ipHeader + sizeof(struct ip));
 
+  // Call the function to print the flow info
+  //print_flowinfo(ipHeader, tcpHeader);
   // Build metadata.
   Metadata md;  
   md.key = getKey(ipHeader, tcpHeader);
@@ -172,6 +272,10 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr* pkthdr, const u_c
 
   // break after STOP_CT packets.
   dbg_packetCt++;
+  countUniqueFlows(ipHeader, tcpHeader);
+  /*if(dbg_packetCt > 3){
+    exit(1);
+  }*/
   #ifdef STOP_CT
     if (dbg_packetCt > STOP_CT){
       printStats();
@@ -232,12 +336,14 @@ void updateTables(Metadata md){
 
 
 void printHeader(){
-  cout << "packet counts, trace time (ms), packets per microflow" << endl;
+  cout << "packet counts, flow counts, avg packet length, trace time (ms), packets per microflow" << endl;
 }
 
 void printStats(){
     float packetsPerMicroflow = float(dbg_packetCt) / float(dbg_evictCt);
-  cout << dbg_packetCt << "," << dur/1000 << "," << packetsPerMicroflow << endl;
+  //cout << dbg_packetCt << "," << dur/1000 << "," << packetsPerMicroflow << endl;
+  cout << dbg_packetCt << "," << uniqueFlows.size() << "," << float(dbg_packetCt)/float(uniqueFlows.size()) << "," << dur/1000 << "," << packetsPerMicroflow << endl;
+  //cout << "Number of unique flows: " << uniqueFlows.size() << endl;
   // fwrite(&mfr, 1, sizeof(mfr), stdout);
   return;
 }
@@ -280,4 +386,75 @@ unsigned simpleHash(const char* s, int len, int maxHashVal)
       h = h * 101 + (unsigned)s[i];
     }
     return h % maxHashVal;
+}
+
+FlowTuple extractFlow(const struct ip* ipHeader, const struct tcphdr* tcpHeader) {
+    // Extract the source and destination IP addresses
+    uint32_t srcIP = (ipHeader->ip_src.s_addr);  // Convert from network to host byte order
+    uint32_t dstIP = (ipHeader->ip_dst.s_addr);  // Convert from network to host byte order
+
+    // Extract the source and destination ports
+    uint16_t srcPort = ntohs(tcpHeader->source);  // Convert from network to host byte order
+    uint16_t dstPort = ntohs(tcpHeader->dest);    // Convert from network to host byte order
+
+    // Extract the protocol
+    uint8_t protocol = ipHeader->ip_p;
+
+    // Return the flow as a tuple
+    return std::make_tuple(srcIP, dstIP, srcPort, dstPort, protocol);
+}
+// Function to extract the flow 5-tuple from the packet
+FlowTuple extractFlowTuple(const u_char* packet) {
+    const struct ip* ipHeader = (struct ip*)(packet + 14);  // Skipping Ethernet header
+    uint32_t srcIP = ipHeader->ip_src.s_addr;
+    uint32_t dstIP = ipHeader->ip_dst.s_addr;
+    uint16_t srcPort = 0;
+    uint16_t dstPort = 0;
+    uint8_t protocol = ipHeader->ip_p;
+
+    if (protocol == IPPROTO_TCP) {
+        const struct tcphdr* tcpHeader = (struct tcphdr*)(packet + 14 + ipHeader->ip_hl * 4);
+        srcPort = ntohs(tcpHeader->source);
+        dstPort = ntohs(tcpHeader->dest);
+    } /*else if (protocol == IPPROTO_UDP) {
+        const struct udphdr* udpHeader = (struct udphdr*)(packet + 14 + ipHeader->ip_hl * 4);
+        srcPort = ntohs(udpHeader->source);
+        dstPort = ntohs(udpHeader->dest);
+    }*/
+
+    return make_tuple(srcIP, dstIP, srcPort, dstPort, protocol);
+}
+
+// Function to convert binary data to a hexadecimal string
+std::string toHexString(const std::string& str) {
+    std::ostringstream hexStream;
+    for (unsigned char c : str) {
+        hexStream << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+    }
+    return hexStream.str();
+}
+
+
+void printFlowTuple(const FlowTuple& flow) {
+    // Extract elements from the tuple
+    uint32_t srcIP, dstIP;
+    uint16_t srcPort, dstPort;
+    uint8_t protocol;
+    
+    tie(srcIP, dstIP, srcPort, dstPort, protocol) = flow;
+    
+    // Convert IP addresses from network byte order to string
+    struct in_addr srcAddr, dstAddr;
+    srcAddr.s_addr = srcIP;
+    dstAddr.s_addr = dstIP;
+    
+    // Convert ports from network byte order to host byte order
+    srcPort = srcPort;
+    dstPort = dstPort;
+    
+    // Print the flow tuple
+    cout << "Flow: "
+         << inet_ntoa(srcAddr) << ":" << srcPort << " -> "
+         << inet_ntoa(dstAddr) << ":" << dstPort
+         << " Protocol: " << static_cast<int>(protocol) << endl;
 }
