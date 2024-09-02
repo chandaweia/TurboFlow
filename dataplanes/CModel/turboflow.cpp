@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdlib.h>
 
+#include <ctime>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -17,6 +18,10 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <filesystem>
+#include <algorithm>  // Include for std::sort
+#include <queue>
+namespace fs = std::filesystem;
 using namespace std;
 
 // Generate 
@@ -32,20 +37,21 @@ using namespace std;
 // Define a type alias for the 5-tuple that uniquely identifies a flow
 using FlowTuple = tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint8_t>;
 
-uint64_t dbg_packetCt;
-uint64_t dbg_evictCt;
-uint64_t total_flowCt;
+uint64_t dbg_packetCt=0;
+uint64_t dbg_evictCt=0;
+uint64_t total_flowCt=0;
 using Flow = tuple<uint32_t, uint32_t, uint16_t, uint16_t, uint8_t>;
 set<FlowTuple> uniqueFlows;
 
-uint64_t dbg_collisionCt;
-uint64_t dbg_removeFlowCt;
-uint64_t dbg_addFlowCt;
+uint64_t dbg_collisionCt=0;
+uint64_t dbg_removeFlowCt=0;
+uint64_t dbg_addFlowCt=0;
+uint64_t dbg_addwithouteviction=0;
 
 // Static options.
 #define traceType 1 // 0 = ethernet pcap, 1 = ip4v pcap (i.e., caida datasets)
 #define KEYLEN 12 // key length in bytes.
-#define STOP_CT 10000000 // stop execution after STOP_CT packets.
+//#define STOP_CT 100000000 // stop execution after STOP_CT packets.
 #define LOG_CT 1000000 // print info every LOG_CT packets.
 
 char nullKey[KEYLEN] = { 0 };
@@ -62,6 +68,17 @@ struct Metadata {
   unsigned hash;
   uint32_t byteCount;  
   uint64_t ts;
+};
+
+struct Packet {
+    struct pcap_pkthdr header;
+    const u_char* data;
+    size_t fileIndex;
+
+    bool operator>(const Packet& other) const {
+        return this->header.ts.tv_sec > other.header.ts.tv_sec ||
+               (this->header.ts.tv_sec == other.header.ts.tv_sec && this->header.ts.tv_usec > other.header.ts.tv_usec);
+    }
 };
 
 // Global state. 
@@ -102,27 +119,206 @@ void countUniqueFlows(const struct ip* ipHeader, const struct tcphdr* tcpHeader)
 std::string toHexString(const std::string& str);
 void printFlowTuple(const FlowTuple& flow);
 
+#if 1
 int main(int argc, char *argv[]) {
-    if (argc < 3){
-        cout << "incorrect number of arguments. Need at least 2. (filenames, hash size)." << endl;
+    if (argc < 3) {
+        cout << "Incorrect number of arguments. Need at least 2. (filenames, hash size)." << endl;
         return 0;
     }
-    
-    int numFiles = argc - 2;
+
     vector<char*> inputFiles;
-    for (int i = 1; i <= numFiles; i++) {
-        inputFiles.push_back(argv[i]);
-        cout << "reading from file: " << argv[i] << endl;
+    for (int i = 2; i < argc - 1; i++) {
+        fs::path path(argv[i]);
+        if (fs::is_regular_file(path)) {
+            inputFiles.push_back(argv[i]);
+        } else if (fs::is_directory(path)) {
+            for (const auto& entry : fs::recursive_directory_iterator(path)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                    string filePath = entry.path().string();
+                    char *fileCStr = new char[filePath.length() + 1];
+                    strcpy(fileCStr, filePath.c_str());
+                    inputFiles.push_back(fileCStr);
+                }
+            }
+        } else {
+            cerr << "Invalid file or directory: " << argv[i] << endl;
+            return 1;
+        }
     }
 
-    int tableSize = atoi(argv[argc - 1]);
+    std::sort(inputFiles.begin(), inputFiles.end(), [](const char* a, const char* b) {
+        return strcmp(a, b) < 0;
+    });
+
+    cout << "The total number of files: " << inputFiles.size() << endl;
+
+    int numFiles = atoi(argv[argc-1]);
+    if(numFiles > inputFiles.size()){
+      numFiles = inputFiles.size();
+    }
+    cout << "numFiles: " << numFiles << endl;
+    int tableSize = atoi(argv[1]);
     stateInit(tableSize);
 
     vector<pcap_t*> descrs;
     char errbuf[PCAP_ERRBUF_SIZE];
 
+    vector<timeval> initialTimestamps(numFiles);
+
+    // Open all PCAP files and get the first packet timestamp
+    for (int i = 0; i < numFiles; i++) {
+        cout<<"inputFiles[i]:"<<inputFiles[i]<<endl;
+        pcap_t *descr = pcap_open_offline(inputFiles[i], errbuf);
+        if (descr == NULL) {
+            cerr << "pcap_open_offline() failed for " << inputFiles[i] << ": " << errbuf << endl;
+            return 1;
+        }
+        descrs.push_back(descr);
+
+        struct pcap_pkthdr* header;
+        const u_char* data;
+        int res = pcap_next_ex(descr, &header, &data);
+        if (res == 1) {
+            initialTimestamps[i] = header->ts;
+        } else {
+            cerr << "Failed to read the first packet from " << inputFiles[i] << endl;
+            return 1;
+        }
+    }
+
+    // Find the earliest timestamp to use as a reference
+    timeval earliestTimestamp = initialTimestamps[0];
+    for (const auto& ts : initialTimestamps) {
+        if (ts.tv_sec < earliestTimestamp.tv_sec || 
+           (ts.tv_sec == earliestTimestamp.tv_sec && ts.tv_usec < earliestTimestamp.tv_usec)) {
+            earliestTimestamp = ts;
+        }
+    }
+
+    printHeader();
+    priority_queue<Packet, vector<Packet>, greater<Packet>> packetQueue;
+    size_t active_pcap_count = descrs.size();
+
+    // Initial fill of the queue
+    for (size_t i = 0; i < descrs.size(); i++) {
+        struct pcap_pkthdr* header;
+        const u_char* data;
+        int res = pcap_next_ex(descrs[i], &header, &data);
+
+        if (res == 1) {
+            // Adjust the timestamp
+            header->ts.tv_sec -= (initialTimestamps[i].tv_sec - earliestTimestamp.tv_sec);
+            header->ts.tv_usec -= (initialTimestamps[i].tv_usec - earliestTimestamp.tv_usec);
+            if (header->ts.tv_usec < 0) {
+                header->ts.tv_sec--;
+                header->ts.tv_usec += 1000000;
+            }
+            packetQueue.push(Packet{*header, data, i});
+        } else if (res == -2) { // EOF reached
+            pcap_close(descrs[i]);
+            descrs[i] = nullptr;
+            active_pcap_count--;
+        } else if (res == -1) {
+            cerr << "pcap_next_ex() failed: " << pcap_geterr(descrs[i]) << endl;
+            return 1;
+        }
+    }
+
+    // Process the queue
+    while (!packetQueue.empty()) {
+        Packet pkt = packetQueue.top();
+        packetQueue.pop();
+
+        packetHandler(nullptr, &pkt.header, pkt.data);
+
+        size_t i = pkt.fileIndex;
+        if (descrs[i] == nullptr) continue;
+
+        struct pcap_pkthdr* header;
+        const u_char* data;
+        int res = pcap_next_ex(descrs[i], &header, &data);
+
+        if (res == 1) {
+            // Adjust the timestamp
+            header->ts.tv_sec -= (initialTimestamps[i].tv_sec - earliestTimestamp.tv_sec);
+            header->ts.tv_usec -= (initialTimestamps[i].tv_usec - earliestTimestamp.tv_usec);
+            if (header->ts.tv_usec < 0) {
+                header->ts.tv_sec--;
+                header->ts.tv_usec += 1000000;
+            }
+            packetQueue.push(Packet{*header, data, i});
+        } else if (res == -2) { // EOF reached
+            pcap_close(descrs[i]);
+            descrs[i] = nullptr;
+            active_pcap_count--;
+        } else if (res == -1) {
+            cerr << "pcap_next_ex() failed: " << pcap_geterr(descrs[i]) << endl;
+            return 1;
+        }
+    }
+
+    cout << "FINAL STATS:" << endl;
+    printStats();
+
+    return 0;
+}
+
+#else
+// Read pcaps interleavely without timestamp. Just read one from each pcaps sequentially.
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        cout << "Incorrect number of arguments. Need at least 2. (filenames, hash size)." << endl;
+        return 0;
+    }
+
+    vector<char*> inputFiles;
+    for (int i = 2; i < argc - 1; i++) {
+        fs::path path(argv[i]);
+        if (fs::is_regular_file(path)) {
+            // If the argument is a file, add it to inputFiles
+            inputFiles.push_back(argv[i]);
+        } else if (fs::is_directory(path)) {
+            // If the argument is a directory, look for .pcap files
+            for (const auto& entry : fs::recursive_directory_iterator(path)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                    string filePath = entry.path().string();
+                    char *fileCStr = new char[filePath.length() + 1];
+                    strcpy(fileCStr, filePath.c_str());
+                    inputFiles.push_back(fileCStr);
+                }
+            }
+        } else {
+            cerr << "Invalid file or directory: " << argv[i] << endl;
+            return 1;
+        }
+    }
+
+    // Sort the inputFiles vector
+    std::sort(inputFiles.begin(), inputFiles.end(), [](const char* a, const char* b) {
+        return strcmp(a, b) < 0;  // Compare C-style strings lexicographically
+    });
+
+    // Print the sorted files
+    int totalfiles=0;
+    for (const auto& file : inputFiles) {
+        //cout << "Reading from file: " << file << endl;
+        totalfiles ++;
+    }
+    cout<<"The total number of files:" << totalfiles <<endl ;
+    
+    //int numFiles = inputFiles.size();
+    int numFiles = atoi(argv[argc-1]);
+    cout<<"numFiles:"<<numFiles<<endl;
+    int tableSize = atoi(argv[1]);
+    stateInit(tableSize);
+    
+    vector<pcap_t*> descrs;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
     // Open all PCAP files
     for (int i = 0; i < numFiles; i++) {
+        //cout<<"inputFiles[i]:"<<inputFiles[i]<<endl;
+        //continue;
         pcap_t *descr = pcap_open_offline(inputFiles[i], errbuf);
         if (descr == NULL) {
             cerr << "pcap_open_offline() failed for " << inputFiles[i] << ": " << errbuf << endl;
@@ -130,12 +326,12 @@ int main(int argc, char *argv[]) {
         }
         descrs.push_back(descr);
     }
-
+    //return 0;
     printHeader();
-
+    size_t i = 0;
     int active_pcap_count = descrs.size();
     while (active_pcap_count > 0) {
-        for (size_t i = 0; i < descrs.size(); i++) {
+        for (i = 0; i < descrs.size(); i++) {
             if (descrs[i] == nullptr) continue;
 
             struct pcap_pkthdr* header;
@@ -161,7 +357,72 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+#endif
 
+#if 0
+int main_inputfiles(int argc, char *argv[]) {
+    if (argc < 3){
+        cout << "incorrect number of arguments. Need at least 2. (filenames, hash size)." << endl;
+        return 0;
+    }
+    
+    int numFiles = argc - 2;
+    vector<char*> inputFiles;
+    for (int i = 1; i <= numFiles; i++) {
+        inputFiles.push_back(argv[i]);
+        cout << "reading from file: " << argv[i] << endl;
+    }
+    
+    int tableSize = atoi(argv[argc - 1]);
+    stateInit(tableSize);
+
+    vector<pcap_t*> descrs;
+    char errbuf[PCAP_ERRBUF_SIZE];
+
+    // Open all PCAP files
+    for (int i = 0; i < numFiles; i++) {
+        pcap_t *descr = pcap_open_offline(inputFiles[i], errbuf);
+        if (descr == NULL) {
+            cerr << "pcap_open_offline() failed for " << inputFiles[i] << ": " << errbuf << endl;
+            return 1;
+        }
+        descrs.push_back(descr);
+    }
+
+    printHeader();
+    size_t i = 0;
+    int active_pcap_count = descrs.size();
+    while (active_pcap_count > 0) {
+        for (i = 0; i < descrs.size(); i++) {
+            //if (descrs[i] == nullptr) continue;
+            if (descrs[i] == nullptr) break;
+
+            struct pcap_pkthdr* header;
+            const u_char* data;
+            int res = pcap_next_ex(descrs[i], &header, &data);
+
+            if (res == 1) { // Packet successfully read
+                packetHandler(nullptr, header, data);
+                
+            } else if (res == -1) { // Error occurred
+                cerr << "pcap_next_ex() failed: " << pcap_geterr(descrs[i]) << endl;
+                return 1;
+            } else if (res == -2) { // EOF reached
+                pcap_close(descrs[i]);
+                descrs[i] = nullptr;
+                active_pcap_count--;
+            }
+        }
+    }
+
+    cout << "FINAL STATS:" << endl;
+    printStats();
+
+    return 0;
+}
+#endif
+
+#if 0
 int main_onepcap(int argc, char *argv[]) {
   if (argc != 3){
     cout << "incorrect number of arguments. Need 2. (filename, hash size)." << endl;
@@ -192,7 +453,7 @@ int main_onepcap(int argc, char *argv[]) {
 
   return 0;
 }
-  
+#endif
 void countUniqueFlows(const struct ip* ipHeader, const struct tcphdr* tcpHeader) {
     //FlowTuple flow = extractFlowTuple(packet);
     FlowTuple flow = extractFlow(ipHeader, tcpHeader);
@@ -273,9 +534,9 @@ void packetHandler(u_char *userData, const struct pcap_pkthdr* pkthdr, const u_c
   // break after STOP_CT packets.
   dbg_packetCt++;
   countUniqueFlows(ipHeader, tcpHeader);
-  /*if(dbg_packetCt > 3){
-    exit(1);
-  }*/
+  //if(dbg_packetCt > 20){
+  //  exit(1);
+  //}
   #ifdef STOP_CT
     if (dbg_packetCt > STOP_CT){
       printStats();
@@ -302,6 +563,7 @@ void updateTables(Metadata md){
   // if the key is null, insert new entry. 
   if (memcmp(curKey, nullKey, KEYLEN) == 0){
     dbg_addFlowCt++;
+    dbg_addwithouteviction++;
     // cout << "inserting new. " << endl;
     memcpy(keyTable[md.hash], md.key.c_str(), KEYLEN);
     packetCountTable[md.hash] = 1;
@@ -312,6 +574,7 @@ void updateTables(Metadata md){
     if (memcmp(curKey, md.key.c_str(), KEYLEN) == 0){
       packetCountTable[md.hash]++;
       byteCountTable[md.hash]+= md.byteCount;
+      dbg_addwithouteviction++;
     }
     // otherwise, it is a collision. Evict and then replace. 
     else {
@@ -336,13 +599,13 @@ void updateTables(Metadata md){
 
 
 void printHeader(){
-  cout << "packet counts, flow counts, avg packet length, trace time (ms), packets per microflow" << endl;
+  cout << "packet counts, flow counts, avg packet length, trace time (ms), packets per microflow,, dbg_evictCt, dbg_addwithouteviction" << endl;
 }
 
 void printStats(){
     float packetsPerMicroflow = float(dbg_packetCt) / float(dbg_evictCt);
   //cout << dbg_packetCt << "," << dur/1000 << "," << packetsPerMicroflow << endl;
-  cout << dbg_packetCt << "," << uniqueFlows.size() << "," << float(dbg_packetCt)/float(uniqueFlows.size()) << "," << dur/1000 << "," << packetsPerMicroflow << endl;
+  cout << dbg_packetCt << "," << uniqueFlows.size() << "," << float(dbg_packetCt)/float(uniqueFlows.size()) << "," << dur/1000 << "," << packetsPerMicroflow << ",," << dbg_evictCt << "," << dbg_addwithouteviction << endl;
   //cout << "Number of unique flows: " << uniqueFlows.size() << endl;
   // fwrite(&mfr, 1, sizeof(mfr), stdout);
   return;
